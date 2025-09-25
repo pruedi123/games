@@ -1,0 +1,463 @@
+# mw.py — Streamlit "Jupiter Points" Spelling Game (Kindergarten‑friendly)
+# ------------------------------------------------------------------------
+# Starts with Jupiter Points = (# of words) × 1.
+# For each word, the app:
+#   1) Says the word 3× (local MW/TTS mp3 if available, else browser speech), then
+#   2) Says a short slow sentence using the word,
+#   3) Lets the child type the spelling.
+# Scoring rules:
+#   • You can only lose at most 1 point per word (on the first wrong try).
+#   • Keep trying until correct; when correct, if you had lost 1 point on that word,
+#     you recover that 1 point immediately. Then we move to the next word.
+#   • Points never go above the starting total.
+#
+# Run:  streamlit run mw.py
+
+from __future__ import annotations
+from typing import List
+from pathlib import Path
+import base64
+import streamlit as st
+
+# ---------------------- UI Config ----------------------
+st.set_page_config(page_title="Jupiter Points — Spelling Game", page_icon="🪐", layout="centered")
+
+# ---------------------- Defaults ----------------------
+DEFAULT_WORDS: List[str] = [
+    "fit", "him", "is", "it", "pin", "sip", "an", "cat",
+    "nap", "pan", "and", "find", "for", "just", "many", "one", "she", "then"
+]
+
+# ---------------------- Local Audio (MW scraped/downloaded or TTS) ----------------------
+AUDIO_DIR_DEFAULT = Path(__file__).parent / "audio_tts"  # default folder for your mp3s
+AUDIO_EXTS = (".mp3", ".wav", ".m4a")
+
+SENT_AUDIO_DIR_DEFAULT = Path(__file__).parent / "audio_sentences"
+
+def get_sentence_audio_dir() -> Path:
+    p = st.session_state.get("sentence_audio_dir")
+    try:
+        return Path(p) if p else SENT_AUDIO_DIR_DEFAULT
+    except Exception:
+        return SENT_AUDIO_DIR_DEFAULT
+
+def find_local_sentence_audio(word: str) -> Path | None:
+    base = get_sentence_audio_dir()
+    if not base.exists():
+        return None
+    wl = word.lower()
+    # prefer explicit "_sentence" name first
+    for ext in AUDIO_EXTS:
+        p = base / f"{wl}_sentence{ext}"
+        if p.exists():
+            return p
+    # fallback to "word.ext"
+    for ext in AUDIO_EXTS:
+        p = base / f"{wl}{ext}"
+        if p.exists():
+            return p
+    # looser matches
+    for ext in AUDIO_EXTS:
+        for p in base.glob(f"{wl}*{ext}"):
+            return p
+    return None
+
+def play_local_audio_once(path: Path, playback_rate: float = 1.0):
+    ext = path.suffix.lower()
+    mime = (
+        "audio/mpeg" if ext == ".mp3" else
+        "audio/wav"  if ext == ".wav" else
+        "audio/mp4"
+    )
+    try:
+        b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
+    except Exception:
+        st.warning(f"Couldn't read sentence audio file: {path}")
+        return
+    st.components.v1.html(
+        f"""
+        <script>
+          (function() {{
+            var rate = {playback_rate};
+            var src = 'data:{mime};base64,{b64}';
+            var audio = new Audio(src);
+            audio.playbackRate = rate;
+            audio.play();
+          }})();
+        </script>
+        """,
+        height=0,
+    )
+
+def get_audio_dir() -> Path:
+    p = st.session_state.get("audio_dir")
+    try:
+        return Path(p) if p else AUDIO_DIR_DEFAULT
+    except Exception:
+        return AUDIO_DIR_DEFAULT
+
+def find_local_audio_for_word(word: str) -> Path | None:
+    base = get_audio_dir()
+    if not base.exists():
+        return None
+    wl = word.lower()
+    for ext in AUDIO_EXTS:
+        p = base / f"{wl}{ext}"
+        if p.exists():
+            return p
+    for ext in AUDIO_EXTS:
+        for p in base.glob(f"{wl}*{ext}"):
+            return p
+    for ext in AUDIO_EXTS:
+        for p in base.glob(f"*{wl}*{ext}"):
+            return p
+    return None
+
+def play_local_audio_loop(path: Path, times: int = 3, gap_ms: int = 850, playback_rate: float = 1.0):
+    """Loop a local audio file N times with a gap between plays (embeds data: URI)."""
+    ext = path.suffix.lower()
+    mime = (
+        "audio/mpeg" if ext == ".mp3" else
+        "audio/wav"  if ext == ".wav" else
+        "audio/mp4"
+    )
+    try:
+        b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
+    except Exception:
+        st.warning(f"Couldn't read audio file: {path}")
+        return
+    st.components.v1.html(
+        f"""
+        <script>
+          (function() {{
+            var times = {times};
+            var count = 0;
+            var gap = {gap_ms};
+            var rate = {playback_rate};
+            var src = 'data:{mime};base64,{b64}';
+            var audio = new Audio(src);
+            audio.playbackRate = rate;
+            audio.addEventListener('ended', function() {{
+              count += 1;
+              if (count < times) {{
+                setTimeout(function() {{ audio.currentTime = 0; audio.play(); }}, gap);
+              }}
+            }});
+            audio.play();
+          }})();
+        </script>
+        """,
+        height=0,
+    )
+
+# ---------------------- Sentence Helpers ----------------------
+SENTENCE_OVERRIDES = {
+    "is": "It is big.",
+    "and": "We play and run.",
+    "for": "This is for you.",
+    "she": "She can hop.",
+    "then": "We ate, then we ran.",
+    "one": "I have one dog.",
+    "an": "I see an ant.",
+    "it": "It is red.",
+    "him": "I can see him.",
+    "many": "I have many books.",
+    "just": "I just won.",
+    "cat": "The cat sat.",
+    "nap": "I take a nap.",
+    "pan": "The pan is hot.",
+    "pin": "I use a pin.",
+    "sip": "Take a sip.",
+    "fit": "I can fit the lid.",
+    "find": "I can find it.",
+}
+
+def a_or_an(word: str) -> str:
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+def build_sentence(word: str) -> str:
+    w = word.lower()
+    if w in SENTENCE_OVERRIDES:
+        return SENTENCE_OVERRIDES[w]
+    no_article = {"many", "few", "some", "none", "one", "two", "three", "she", "he", "they", "we", "it", "and", "or", "for", "then", "is"}
+    if w in no_article:
+        return f"We can use the word '{word}'."
+    return f"I see {a_or_an(w)} {word}."
+
+# --- Browser SpeechSynthesis fallback (when no local file) ---
+
+def say_word_repeat(word: str, times: int = 3, rate: float = 0.8, gap_ms: int = 850):
+    st.components.v1.html(
+        f"""
+        <script>
+          (function() {{
+            const txt = {word!r};
+            const times = {times};
+            const gap = {gap_ms};
+            const rate = {rate};
+            let i = 0;
+            function speakOne() {{
+              const u = new SpeechSynthesisUtterance(txt);
+              u.lang = 'en-US';
+              u.rate = rate;
+              u.pitch = 1.0;
+              u.onend = () => {{
+                i += 1;
+                if (i < times) setTimeout(speakOne, gap);
+              }};
+              try {{ speechSynthesis.cancel(); }} catch (e) {{}}
+              speechSynthesis.speak(u);
+            }}
+            try {{ speechSynthesis.cancel(); }} catch (e) {{}}
+            speakOne();
+          }})();
+        </script>
+        """,
+        height=0,
+    )
+
+def say_sentence(word: str, delay_ms: int = 0, rate: float = 0.85):
+    sentence = build_sentence(word)
+    st.components.v1.html(
+        f"""
+        <script>
+          (function() {{
+            const sentence = {sentence!r};
+            const delay = Math.max(30, {delay_ms});
+            const rate = {rate};
+            function speak() {{
+              try {{ speechSynthesis.cancel(); }} catch (e) {{}}
+              const u = new SpeechSynthesisUtterance(sentence);
+              u.lang = 'en-US';
+              u.rate = rate;   // slower for kinders if requested
+              u.pitch = 0.95;
+              speechSynthesis.speak(u);
+            }}
+            try {{ speechSynthesis.cancel(); }} catch (e) {{}}
+            setTimeout(speak, delay);
+          }})();
+        </script>
+        """,
+        height=0,
+    )
+
+HAS_GTTS = False
+try:
+    from gtts import gTTS  # optional, only for sentence file generation
+    HAS_GTTS = True
+except Exception:
+    HAS_GTTS = False
+
+def say_sentence_on_click(word: str, kinder: bool):
+    # If user prefers local sentence audio and a file exists, play it; else browser TTS
+    if st.session_state.get("prefer_local_sentence_audio", True):
+        p = find_local_sentence_audio(word)
+        if p is not None:
+            play_local_audio_once(p, playback_rate=(0.6 if kinder else 1.0))
+            return
+    # Fallback to browser TTS
+    say_sentence(word, delay_ms=0, rate=(0.6 if kinder else 0.85))
+
+# ---------------------- State -------------------------
+
+def init_state():
+    ss = st.session_state
+    if "words" not in ss:
+        ss.words = DEFAULT_WORDS.copy()
+    if "idx" not in ss:
+        ss.idx = 0
+    if "attempted_penalty" not in ss:
+        ss.attempted_penalty = False
+    if "total_points" not in ss:
+        ss.total_points = len(ss.words)
+    if "current_points" not in ss:
+        ss.current_points = ss.total_points
+    if "listen_nonce" not in ss:
+        ss.listen_nonce = 0
+    if "last_feedback" not in ss:
+        ss.last_feedback = ""
+    if "auto_play" not in ss:
+        ss.auto_play = True
+    if "last_spoken_idx" not in ss:
+        ss.last_spoken_idx = -1
+    if "_retry_speak" not in ss:
+        ss._retry_speak = False
+    if "sentence_audio_dir" not in ss:
+        ss.sentence_audio_dir = str(SENT_AUDIO_DIR_DEFAULT)
+    if "prefer_local_sentence_audio" not in ss:
+        ss.prefer_local_sentence_audio = True
+
+init_state()
+
+# ---------------------- Sidebar -----------------------
+st.sidebar.header("Spelling List (Teacher)")
+raw = st.sidebar.text_area(
+    "Paste words (one per line or commas)",
+    value="\n".join(st.session_state.words),
+    height=160,
+)
+
+def parse_words(raw: str) -> List[str]:
+    parts = [p.strip() for p in raw.replace(",", "\n").splitlines()]
+    return [p for p in parts if p]
+
+col_a, col_b = st.sidebar.columns(2)
+if col_a.button("Load list", use_container_width=True):
+    st.session_state.words = parse_words(raw)
+    st.session_state.idx = 0
+    st.session_state.total_points = len(st.session_state.words)
+    st.session_state.current_points = st.session_state.total_points
+    st.session_state.attempted_penalty = False
+    st.session_state.last_feedback = ""
+    st.session_state.last_spoken_idx = -1
+    st.session_state._retry_speak = False
+    st.session_state.listen_nonce += 1
+if col_b.button("Restart", use_container_width=True):
+    st.session_state.idx = 0
+    st.session_state.current_points = st.session_state.total_points
+    st.session_state.attempted_penalty = False
+    st.session_state.last_feedback = ""
+    st.session_state.last_spoken_idx = -1
+    st.session_state._retry_speak = False
+    st.session_state.listen_nonce += 1
+
+st.sidebar.markdown("---")
+st.sidebar.caption("Tip: The app auto-plays the word 3×. Click the Sentence button any time to hear a sentence.")
+st.session_state.audio_dir = st.sidebar.text_input(
+    "Local audio folder (mp3s)",
+    value=str(st.session_state.get("audio_dir", AUDIO_DIR_DEFAULT)),
+)
+force_local = st.sidebar.checkbox(
+    "Prefer local audio when available",
+    value=True,
+    help="If a local file exists for a word, play it instead of browser speech.",
+)
+st.sidebar.checkbox("Auto play each word (3× then sentence)", value=st.session_state.auto_play, key="auto_play")
+kinder = st.sidebar.checkbox("Kindergarten Mode (very slow)", value=False, help="Speak extra-slow like to a 5-year-old.")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Sentence Audio")
+st.session_state.sentence_audio_dir = st.sidebar.text_input(
+    "Sentence audio folder",
+    value=str(st.session_state.get("sentence_audio_dir", SENT_AUDIO_DIR_DEFAULT)),
+)
+st.sidebar.checkbox(
+    "Prefer local sentence audio when available",
+    value=st.session_state.get("prefer_local_sentence_audio", True),
+    key="prefer_local_sentence_audio",
+)
+# Optional: one-click TTS generation for sentences
+if HAS_GTTS and st.sidebar.button("Generate TTS sentence files for this list"):
+    outdir = get_sentence_audio_dir()
+    outdir.mkdir(parents=True, exist_ok=True)
+    made, fails = 0, []
+    for w in st.session_state.words:
+        try:
+            text = build_sentence(w)
+            mp = outdir / f"{w.lower()}_sentence.mp3"
+            gTTS(text=text, lang="en", slow=True).save(str(mp))
+            made += 1
+        except Exception as e:
+            fails.append(w)
+    if made:
+        st.success(f"Generated {made} sentence file(s) in {outdir}")
+    if fails:
+        st.warning("Failed: " + ", ".join(fails))
+
+# ---------------------- Main UI -----------------------
+st.title("🪐 Jupiter Points — Spelling Game")
+st.caption("Words are spoken; the child types the spelling. Lose at most 1 point per word; recover it when correct.")
+
+wds = st.session_state.words
+N = len(wds)
+idx = st.session_state.idx
+points = st.session_state.current_points
+start_points = st.session_state.total_points
+
+st.markdown(f"**Word:** {idx+1} / {N}  &nbsp;|&nbsp;  **Jupiter Points:** {points} / {start_points}")
+
+# Small note about audio sources
+st.caption("Word uses local audio when available; Sentence uses local sentence audio (if provided) or the browser voice.")
+
+# End-of-list guard and current word binding
+if idx >= N:
+    st.success("All words complete! 🎉")
+    st.balloons()
+    st.stop()
+
+word = wds[idx]
+
+# Show which local file will be used (if any)
+p_preview = find_local_audio_for_word(word)
+if p_preview is not None:
+    st.caption(f"Using local audio: {p_preview.name}")
+
+# Auto play on new word (once per index): say the word 3× only
+if st.session_state.auto_play and st.session_state.last_spoken_idx != idx:
+    p = find_local_audio_for_word(word)
+    if force_local and p is not None:
+        play_local_audio_loop(p, times=3, gap_ms=850, playback_rate=(0.6 if kinder else 1.0))
+    else:
+        say_word_repeat(word, times=3, rate=(0.35 if kinder else 0.8), gap_ms=850)
+    st.session_state.last_spoken_idx = idx
+
+# Hearing controls
+with st.container(border=True):
+    cc1, cc2 = st.columns(2)
+    if cc1.button("🔊 Say 3×", use_container_width=True):
+        p = find_local_audio_for_word(word)
+        if force_local and p is not None:
+            play_local_audio_loop(p, times=3, gap_ms=850, playback_rate=(0.6 if kinder else 1.0))
+        else:
+            say_word_repeat(word, times=3, rate=(0.35 if kinder else 0.8), gap_ms=850)
+    if cc2.button("🔊 Sentence", use_container_width=True):
+        say_sentence_on_click(word, kinder)
+
+# Input and checking
+st.markdown("**Type the word you heard:**")
+with st.form(key=f"listen_form_{st.session_state.listen_nonce}"):
+    guess = st.text_input("Your spelling", value="", key=f"guess_{st.session_state.listen_nonce}")
+    submitted = st.form_submit_button("Check ✔️")
+
+if submitted:
+    g = (guess or "").strip().lower()
+    target = word.lower()
+    if g == target:
+        if st.session_state.attempted_penalty:
+            st.session_state.current_points = min(start_points, st.session_state.current_points + 1)
+        st.session_state.attempted_penalty = False
+        st.session_state.last_feedback = "✅ You were right! (Moving to next word.)"
+        st.session_state._retry_speak = False
+        st.session_state.idx += 1
+        st.session_state.listen_nonce += 1
+    else:
+        if not st.session_state.attempted_penalty:
+            st.session_state.current_points = max(0, st.session_state.current_points - 1)
+            st.session_state.attempted_penalty = True
+        st.session_state.last_feedback = "❌ Not yet. Try again — you can earn the point back when you get it right!"
+        st.session_state._retry_speak = True
+        st.session_state.listen_nonce += 1
+
+# Auto speak again on retry (after a wrong answer): say the word 3× only
+if st.session_state._retry_speak and idx < N:
+    p = find_local_audio_for_word(word)
+    if force_local and p is not None:
+        play_local_audio_loop(p, times=3, gap_ms=850, playback_rate=(0.6 if kinder else 1.0))
+    else:
+        say_word_repeat(word, times=3, rate=(0.35 if kinder else 0.8), gap_ms=850)
+    st.session_state._retry_speak = False
+
+# Feedback banner
+if st.session_state.last_feedback:
+    st.info(st.session_state.last_feedback)
+
+# Quick repeats
+hr1, hr2 = st.columns(2)
+if hr1.button("🔁 Hear again (3×)"):
+    p = find_local_audio_for_word(word)
+    if force_local and p is not None:
+        play_local_audio_loop(p, times=3, gap_ms=850, playback_rate=(0.6 if kinder else 1.0))
+    else:
+        say_word_repeat(word, times=3, rate=(0.35 if kinder else 0.8), gap_ms=850)
+if hr2.button("🗣️ Sentence again"):
+    say_sentence_on_click(word, kinder)
