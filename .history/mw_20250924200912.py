@@ -316,6 +316,7 @@ def fetch_mw_audio_for_word(word: str, api_key: str, dict_name: str = "learners"
         return False, f"Download failed: {e}"
 
 
+
 def clear_local_audio_for_words(words: list[str]):
     """Remove any local audio files for these words from both audio_tts and audio_mw."""
     wl = [w.lower() for w in words]
@@ -329,6 +330,28 @@ def clear_local_audio_for_words(words: list[str]):
                     os.remove(folder / name)
                 except Exception:
                     pass
+
+# --- Helper: Fetch MW audio for an entire list with progress bar ---
+def fetch_mw_for_list(words: list[str], api_key: str, dict_name: str) -> tuple[int, list[str]]:
+    """Fetch MW audio for a list of words with a Streamlit progress bar.
+    Returns (ok_count, failed_messages)."""
+    ok, fails = 0, []
+    try:
+        pb = st.progress(0.0, text="Downloading dictionary audio…")
+    except Exception:
+        pb = None
+    total = max(1, len(words))
+    for i, w in enumerate(words, 1):
+        ok1, msg = fetch_mw_audio_for_word(w, api_key, dict_name)
+        if ok1:
+            ok += 1
+        else:
+            fails.append(f"{w}: {msg}")
+        if pb is not None:
+            pb.progress(min(1.0, i/total), text=f"{i}/{total} — {w}")
+    if pb is not None:
+        pb.empty()
+    return ok, fails
 
 def play_local_audio_loop(path: Path, times: int = 3, gap_ms: int = 850, playback_rate: float = 1.0):
     """Loop a local audio file N times with a gap between plays (embeds data: URI)."""
@@ -673,6 +696,14 @@ if col_a.button("Load list", use_container_width=True):
     st.session_state._retry_speak = False
     st.session_state.listen_nonce += 1
     st.session_state.auto_play = False
+    # If enabled and API key present, auto‑fetch dictionary audio for the new list
+    if 'auto_fetch_on_load' in locals() and auto_fetch_on_load and api_key:
+        ok_cnt, fails = fetch_mw_for_list(st.session_state.words, api_key, dict_name)
+        if ok_cnt:
+            st.success(f"Downloaded {ok_cnt} MW audio file(s) to {AUDIO_MW_DIR}.")
+            st.session_state.last_spoken_idx = -1
+        if fails:
+            st.warning("Issues: " + ", ".join(fails[:6]) + (" …" if len(fails) > 6 else ""))
     st.rerun()
 if col_b.button("Restart", use_container_width=True):
     st.session_state.idx = 0
@@ -699,6 +730,14 @@ if col_c.button("Clear & Load", use_container_width=True):
     st.session_state.listen_nonce += 1
     st.session_state.auto_play = False
     st.session_state.suppress_autoplay_once = True
+    # If enabled and API key present, auto‑fetch dictionary audio for the new list
+    if 'auto_fetch_on_load' in locals() and auto_fetch_on_load and api_key:
+        ok_cnt, fails = fetch_mw_for_list(st.session_state.words, api_key, dict_name)
+        if ok_cnt:
+            st.success(f"Downloaded {ok_cnt} MW audio file(s) to {AUDIO_MW_DIR}.")
+            st.session_state.last_spoken_idx = -1
+        if fails:
+            st.warning("Issues: " + ", ".join(fails[:6]) + (" …" if len(fails) > 6 else ""))
     st.rerun()
 
 # --- File uploader for word lists (.txt, .csv, .pdf) ---
@@ -785,6 +824,14 @@ if uploaded is not None:
             st.session_state.suppress_autoplay_once = True  # require teacher to click Say 3×
             st.session_state.last_upload_key = key
             st.success(f"Loaded {len(cleaned)} words from {uploaded.name}")
+            # Auto‑fetch for uploaded lists as well
+            if 'auto_fetch_on_load' in locals() and auto_fetch_on_load and api_key:
+                ok_cnt, fails = fetch_mw_for_list(cleaned, api_key, dict_name)
+                if ok_cnt:
+                    st.success(f"Downloaded {ok_cnt} MW audio file(s) to {AUDIO_MW_DIR}.")
+                    st.session_state.last_spoken_idx = -1
+                if fails:
+                    st.warning("Issues: " + ", ".join(fails[:6]) + (" …" if len(fails) > 6 else ""))
             st.rerun()
         else:
             st.sidebar.warning("No valid words found in the uploaded file.")
@@ -819,6 +866,12 @@ dict_name = st.sidebar.selectbox(
     "Dictionary",
     ["learners", "collegiate"],
     index=(0 if _default_dict == "learners" else 1)
+)
+# Option: auto-download MW audio on list load
+auto_fetch_on_load = st.sidebar.checkbox(
+    "Auto‑download MW audio when loading a list",
+    value=True,
+    help="If on, whenever you Load or Clear & Load, the app will download dictionary audio for those words into audio_mw/."
 )
 
 col_mw1, col_mw2 = st.sidebar.columns(2)

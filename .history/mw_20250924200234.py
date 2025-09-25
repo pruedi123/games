@@ -805,21 +805,8 @@ kinder = st.sidebar.checkbox("Kindergarten Mode (very slow)", value=False, help=
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Merriam‑Webster (optional)")
-# Allow setting via environment variables so you don't hardcode keys in source
-_default_api_key = os.environ.get("MW_API_KEY", "")
-_default_dict = os.environ.get("MW_DICT", "learners").lower()
-if _default_dict not in ("learners", "collegiate"):
-    _default_dict = "learners"
-api_key = st.sidebar.text_input(
-    "API key",
-    value=_default_api_key,
-    type="password",
-    help="Set MW_API_KEY env var to prefill. Get a free key at dictionaryapi.com; usage subject to their TOS.")
-dict_name = st.sidebar.selectbox(
-    "Dictionary",
-    ["learners", "collegiate"],
-    index=(0 if _default_dict == "learners" else 1)
-)
+api_key = st.sidebar.text_input("API key", type="password", help="Get a free key at dictionaryapi.com; usage subject to their TOS.")
+dict_name = st.sidebar.selectbox("Dictionary", ["learners", "collegiate"], index=0)
 
 col_mw1, col_mw2 = st.sidebar.columns(2)
 log_lines = st.session_state.get("mw_log", [])
