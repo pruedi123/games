@@ -886,29 +886,6 @@ if HAS_GTTS and st.sidebar.button("Generate TTS sentence files for this list"):
     if fails:
         st.warning("Failed: " + ", ".join(fails))
 
-# --- Word Audio (no key) using gTTS ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("Word Audio (no key)")
-if HAS_GTTS:
-    if st.sidebar.button("Generate TTS word files for this list"):
-        outdir = get_audio_dir()
-        outdir.mkdir(parents=True, exist_ok=True)
-        made, fails = 0, []
-        for w in st.session_state.words:
-            try:
-                mp = outdir / f"{w.lower()}.mp3"
-                gTTS(text=w, lang="en", slow=True).save(str(mp))
-                made += 1
-            except Exception:
-                fails.append(w)
-        if made:
-            st.success(f"Generated {made} word file(s) in {outdir}")
-            st.session_state.last_spoken_idx = -1  # ensure next click picks up local audio
-        if fails:
-            st.warning("Failed: " + ", ".join(fails))
-else:
-    st.sidebar.info("Install gTTS to enable offline word mp3s: pip install gTTS")
-
 st.sidebar.markdown("---")
 st.sidebar.subheader("Clarity Options")
 super_clear = st.sidebar.checkbox("Super‑clear sentence (word‑by‑word)", value=False,
