@@ -20,6 +20,10 @@ import base64
 import streamlit as st
 import unicodedata
 import io, csv, re
+import os, json, shutil
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 
 # ---------------------- UI Config ----------------------
 st.set_page_config(page_title="Jupiter Points — Spelling Game", page_icon="🪐", layout="centered")
@@ -51,6 +55,9 @@ DEFAULT_WORDS: List[str] = [
 
 # ---------------------- Local Audio (MW scraped/downloaded or TTS) ----------------------
 AUDIO_DIR_DEFAULT = Path(__file__).parent / "audio_tts"  # default folder for your mp3s
+AUDIO_MW_DIR = Path(__file__).parent / "audio_mw"  # optional: MW downloads
+AUDIO_DIR_DEFAULT.mkdir(parents=True, exist_ok=True)
+AUDIO_MW_DIR.mkdir(parents=True, exist_ok=True)
 AUDIO_EXTS = (".mp3", ".wav", ".m4a")
 
 SENT_AUDIO_DIR_DEFAULT = Path(__file__).parent / "audio_sentences"
@@ -210,21 +217,118 @@ def get_audio_dir() -> Path:
         return AUDIO_DIR_DEFAULT
 
 def find_local_audio_for_word(word: str) -> Path | None:
-    base = get_audio_dir()
-    if not base.exists():
+    """Return a local audio file for the word, preferring MW downloads first."""
+    wl = (word or "").lower()
+
+    def _scan_dir(folder: Path) -> Path | None:
+        if not folder.exists():
+            return None
+        # exact name first
+        for ext in AUDIO_EXTS:
+            p = folder / f"{wl}{ext}"
+            if p.exists():
+                return p
+        # prefix/suffix variants
+        for ext in AUDIO_EXTS:
+            for p in folder.glob(f"{wl}*{ext}"):
+                return p
+        for ext in AUDIO_EXTS:
+            for p in folder.glob(f"*{wl}*{ext}"):
+                return p
         return None
-    wl = word.lower()
-    for ext in AUDIO_EXTS:
-        p = base / f"{wl}{ext}"
-        if p.exists():
-            return p
-    for ext in AUDIO_EXTS:
-        for p in base.glob(f"{wl}*{ext}"):
-            return p
-    for ext in AUDIO_EXTS:
-        for p in base.glob(f"*{wl}*{ext}"):
-            return p
-    return None
+
+    teacher_dir = get_audio_dir()
+    # Prefer MW first; then any teacher-provided files
+    return _scan_dir(AUDIO_MW_DIR) or _scan_dir(teacher_dir)
+
+# ---------------------- Merriam‑Webster audio helpers ----------------------
+MW_DICT_CHOICES = {"learners": "https://www.dictionaryapi.com/api/v3/references/learners/json/",
+                   "collegiate": "https://www.dictionaryapi.com/api/v3/references/collegiate/json/"}
+MW_AUDIO_BASE = "https://media.merriam-webster.com/audio/prons/en/us/mp3/"
+
+def _mw_audio_subdir(audio_code: str) -> str:
+    ac = audio_code
+    if ac.startswith("bix"):
+        return "bix"
+    if ac.startswith("gg"):
+        return "gg"
+    if not ac[0].isalpha():
+        return "number"
+    return ac[0]
+
+def fetch_mw_audio_for_word(word: str, api_key: str, dict_name: str = "learners") -> tuple[bool, str | Path]:
+    """Download the first available MW audio mp3 for `word` into AUDIO_MW_DIR.
+    Returns (ok, path_or_msg)."""
+    endpoint = MW_DICT_CHOICES.get(dict_name, MW_DICT_CHOICES["learners"]) + quote(word) + f"?key={api_key}"
+    try:
+        req = Request(endpoint, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req, timeout=15) as r:
+            raw = r.read().decode("utf-8", errors="ignore")
+        data = json.loads(raw)
+    except HTTPError as e:
+        return False, f"HTTP {e.code} for {dict_name}. Check that your key matches this dictionary."
+    except URLError as e:
+        return False, f"Network error: {e.reason}"
+    except Exception as e:
+        return False, f"API error: {e}"
+
+    # data may be a list of entries or suggestions; find first with audio
+    audio_code = None
+    try:
+        for entry in data:
+            prs = (entry or {}).get("hwi", {}).get("prs", [])
+            for pr in prs:
+                snd = pr.get("sound")
+                if snd and snd.get("audio"):
+                    audio_code = snd["audio"]
+                    break
+            if audio_code:
+                break
+    except Exception:
+        audio_code = None
+
+    if not audio_code:
+        # Try to surface a helpful hint if we got suggestions instead of entries
+        try:
+            if data and isinstance(data[0], str):
+                return False, "No audio (suggestions returned). Try different dictionary or word form."
+        except Exception:
+            pass
+        return False, "No audio for word"
+
+    sub = _mw_audio_subdir(audio_code)
+    url = f"{MW_AUDIO_BASE}{sub}/{quote(audio_code)}.mp3"
+
+    try:
+        req2 = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req2, timeout=20) as r2:
+            content = r2.read()
+        AUDIO_MW_DIR.mkdir(parents=True, exist_ok=True)
+        out = AUDIO_MW_DIR / f"{word.lower()}.mp3"
+        with open(out, "wb") as f:
+            f.write(content)
+        return True, out
+    except HTTPError as e:
+        return False, f"Audio CDN HTTP {e.code}"
+    except URLError as e:
+        return False, f"Audio CDN network error: {e.reason}"
+    except Exception as e:
+        return False, f"Download failed: {e}"
+
+
+def clear_local_audio_for_words(words: list[str]):
+    """Remove any local audio files for these words from both audio_tts and audio_mw."""
+    wl = [w.lower() for w in words]
+    for folder in (AUDIO_DIR_DEFAULT, AUDIO_MW_DIR):
+        if not folder.exists():
+            continue
+        for name in os.listdir(folder):
+            root, ext = os.path.splitext(name)
+            if ext.lower() in AUDIO_EXTS and root.lower() in wl:
+                try:
+                    os.remove(folder / name)
+                except Exception:
+                    pass
 
 def play_local_audio_loop(path: Path, times: int = 3, gap_ms: int = 850, playback_rate: float = 1.0):
     """Loop a local audio file N times with a gap between plays (embeds data: URI)."""
@@ -700,6 +804,60 @@ st.sidebar.checkbox("Auto play each word (3× then sentence)", value=st.session_
 kinder = st.sidebar.checkbox("Kindergarten Mode (very slow)", value=False, help="Speak extra-slow like to a 5-year-old.")
 
 st.sidebar.markdown("---")
+st.sidebar.subheader("Merriam‑Webster (optional)")
+api_key = st.sidebar.text_input("API key", type="password", help="Get a free key at dictionaryapi.com; usage subject to their TOS.")
+dict_name = st.sidebar.selectbox("Dictionary", ["learners", "collegiate"], index=0)
+
+col_mw1, col_mw2 = st.sidebar.columns(2)
+log_lines = st.session_state.get("mw_log", [])
+if col_mw1.button("Fetch MW audio for this list", use_container_width=True, disabled=not bool(api_key)):
+    words = list(st.session_state.words)
+    ok, fail = 0, []
+    new_log = []
+    for w in words:
+        ok1, msg = fetch_mw_audio_for_word(w, api_key, dict_name)
+        if ok1:
+            ok += 1; new_log.append(f"✔ {w} → saved")
+        else:
+            fail.append(f"{w} ({msg})"); new_log.append(f"✖ {w} → {msg}")
+    st.session_state["mw_log"] = new_log
+    if ok:
+        st.success(f"Downloaded {ok} MW audio file(s) to {AUDIO_MW_DIR}.")
+        st.caption(f"Saved in: {AUDIO_MW_DIR}")
+        st.session_state.last_spoken_idx = -1
+    if fail:
+        st.warning("Issues: " + ", ".join(fail[:6]) + (" …" if len(fail) > 6 else ""))
+
+if col_mw2.button("Clear audio for this list", use_container_width=True):
+    try:
+        clear_local_audio_for_words(list(st.session_state.words))
+        st.success("Cleared local audio for current list.")
+        st.session_state["mw_log"] = ["(cleared)"]
+    except Exception as e:
+        st.sidebar.error(f"Clear failed: {e}")
+
+# One‑word tester (current word)
+col_mw3, col_mw4 = st.sidebar.columns(2)
+if col_mw3.button("Test fetch for current word", use_container_width=True, disabled=not bool(api_key)):
+    try:
+        cur = st.session_state.words[st.session_state.idx]
+        ok1, msg = fetch_mw_audio_for_word(cur, api_key, dict_name)
+        if ok1:
+            st.success(f"Saved MW audio for '{cur}'."); st.session_state.last_spoken_idx = -1
+        else:
+            st.warning(f"{cur}: {msg}")
+    except Exception as e:
+        st.sidebar.error(f"Tester failed: {e}")
+if col_mw4.button("Open MW folder path", use_container_width=True):
+    st.info(f"MW files: {AUDIO_MW_DIR}")
+
+# Show debug log
+if st.session_state.get("mw_log"):
+    with st.sidebar.expander("MW fetch log", expanded=False):
+        for line in st.session_state["mw_log"]:
+            st.code(line)
+
+st.sidebar.markdown("---")
 st.sidebar.subheader("Sentence Audio")
 st.session_state.sentence_audio_dir = st.sidebar.text_input(
     "Sentence audio folder",
@@ -727,6 +885,29 @@ if HAS_GTTS and st.sidebar.button("Generate TTS sentence files for this list"):
         st.success(f"Generated {made} sentence file(s) in {outdir}")
     if fails:
         st.warning("Failed: " + ", ".join(fails))
+
+# --- Word Audio (no key) using gTTS ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Word Audio (no key)")
+if HAS_GTTS:
+    if st.sidebar.button("Generate TTS word files for this list"):
+        outdir = get_audio_dir()
+        outdir.mkdir(parents=True, exist_ok=True)
+        made, fails = 0, []
+        for w in st.session_state.words:
+            try:
+                mp = outdir / f"{w.lower()}.mp3"
+                gTTS(text=w, lang="en", slow=True).save(str(mp))
+                made += 1
+            except Exception:
+                fails.append(w)
+        if made:
+            st.success(f"Generated {made} word file(s) in {outdir}")
+            st.session_state.last_spoken_idx = -1  # ensure next click picks up local audio
+        if fails:
+            st.warning("Failed: " + ", ".join(fails))
+else:
+    st.sidebar.info("Install gTTS to enable offline word mp3s: pip install gTTS")
 
 st.sidebar.markdown("---")
 st.sidebar.subheader("Clarity Options")
@@ -918,14 +1099,22 @@ word = wds[idx]
 
 # Show which local file will be used (if any) — prepare text, render inside the first container to reduce spacing
 p_preview = find_local_audio_for_word(word)
-preview_text = f"Using local audio: {p_preview.name}" if p_preview is not None else ""
+if p_preview is not None:
+    src = "MW" if str(p_preview).startswith(str(AUDIO_MW_DIR)) else "Local"
+    preview_text = f"Using {src} audio: {p_preview.name}"
+else:
+    preview_text = ""
+
+# MW local file location reminder
+if p_preview is not None and src == "MW":
+    st.caption(f"MW file found in: {AUDIO_MW_DIR}")
 
 
 # Auto play on new word (once per index): say the word 3× only (unless suppressed once)
 if st.session_state.last_spoken_idx != idx:
     if st.session_state.auto_play and not st.session_state.suppress_autoplay_once:
         p = find_local_audio_for_word(word)
-        if force_local and p is not None:
+        if p is not None:
             play_local_audio_loop(p, times=3, gap_ms=850, playback_rate=(0.6 if kinder else 1.0))
         else:
             say_word_repeat(word, times=3, rate=(0.35 if kinder else 0.8), gap_ms=850)
@@ -943,7 +1132,7 @@ with st.container(border=True):
     cc1, cc2 = st.columns(2)
     if cc1.button("🔊 Say Next Word 3×", use_container_width=True):
         p = find_local_audio_for_word(word)
-        if force_local and p is not None:
+        if p is not None:
             play_local_audio_loop(p, times=3, gap_ms=850, playback_rate=(0.6 if kinder else 1.0))
         else:
             say_word_repeat(word, times=3, rate=(0.35 if kinder else 0.8), gap_ms=850)
@@ -1012,7 +1201,7 @@ if st.session_state.last_feedback:
 hr1, hr2 = st.columns(2)
 if hr1.button("🔁 Hear again (3×)"):
     p = find_local_audio_for_word(word)
-    if force_local and p is not None:
+    if p is not None:
         play_local_audio_loop(p, times=3, gap_ms=850, playback_rate=(0.6 if kinder else 1.0))
     else:
         say_word_repeat(word, times=3, rate=(0.35 if kinder else 0.8), gap_ms=850)
